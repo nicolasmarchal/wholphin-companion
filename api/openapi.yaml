@@ -1,0 +1,406 @@
+openapi: 3.1.0
+info:
+  title: Wholphin Companion API
+  version: 0.1.0
+  description: >-
+    Minimal LAN-side orchestration API. It never returns tracker URLs, magnets,
+    passkeys or upstream credentials. Seerr is intentionally outside this API.
+servers:
+  - url: https://companion.lan
+security:
+  - bffSession: []
+paths:
+  /openapi.yaml:
+    get:
+      security: []
+      operationId: getOpenApi
+      responses:
+        '200':
+          description: This document
+          content:
+            application/yaml:
+              schema: { type: string }
+  /healthz:
+    get:
+      security: []
+      operationId: health
+      responses:
+        '200': { description: Process is alive }
+  /readyz:
+    get:
+      security: []
+      operationId: ready
+      responses:
+        '200': { description: SQLite state store is ready }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+  /v1/session:
+    post:
+      security:
+        - jellyfinToken: []
+      operationId: exchangeJellyfinSession
+      description: >-
+        Validates X-Jellyfin-Token against Jellyfin /Users/Me, checks the local
+        allow-list, then returns an opaque BFF token. The Jellyfin token is not
+        stored. Subsequent Jellyfin PlaybackInfo checks use the job owner's
+        explicit userId together with the server-side Jellyfin credential.
+      responses:
+        '201':
+          description: BFF session
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Session' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '502': { $ref: '#/components/responses/BadGateway' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+        '504': { $ref: '#/components/responses/GatewayTimeout' }
+    delete:
+      operationId: revokeSession
+      responses:
+        '204': { description: Revoked or already absent }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /v1/capabilities:
+    get:
+      operationId: getCapabilities
+      responses:
+        '200':
+          description: Optional data capabilities
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [hasQbittorrentMetrics, supportsCancellation]
+                properties:
+                  hasQbittorrentMetrics: { type: boolean }
+                  supportsCancellation: { type: boolean }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /v1/releases/search:
+    post:
+      operationId: startReleaseSearch
+      description: Starts a durable Radarr or Sonarr interactive search.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Subject' }
+      responses:
+        '202':
+          description: Search accepted; follow the returned searchId.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ReleaseSearch' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+  /v1/releases/search/{searchId}:
+    parameters:
+      - name: searchId
+        in: path
+        required: true
+        schema: { type: string }
+    get:
+      operationId: getReleaseSearch
+      responses:
+        '200':
+          description: Current state and, once complete, safe release metadata.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ReleaseSearch' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '410': { $ref: '#/components/responses/Expired' }
+  /v1/acquisitions:
+    post:
+      operationId: acquireRelease
+      description: >-
+        Grabs only the release represented by the opaque token. Idempotency-Key
+        is mandatory. A timeout after dispatch becomes dispatch_uncertain and is
+        reconciled; it is never silently retried with another release.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [token]
+              properties:
+                token: { type: string, minLength: 32, maxLength: 256 }
+      responses:
+        '200':
+          description: Existing acquisition returned for a duplicate confirmation.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Acquisition' }
+        '202':
+          description: Exact release accepted for dispatch or reconciliation.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Acquisition' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '410': { $ref: '#/components/responses/Expired' }
+        '422': { $ref: '#/components/responses/Unprocessable' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '502': { $ref: '#/components/responses/BadGateway' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+        '504': { $ref: '#/components/responses/GatewayTimeout' }
+    get:
+      operationId: listAcquisitions
+      description: >-
+        Rehydrates jobs owned by the current user. Use tmdbId with mediaType to
+        avoid collisions between movie and TV TMDb namespaces after an app
+        restart. kind remains available for an exact season/episode subject.
+      parameters:
+        - name: active
+          in: query
+          schema: { type: boolean, default: false }
+        - name: kind
+          in: query
+          schema: { $ref: '#/components/schemas/SubjectKind' }
+        - name: mediaType
+          in: query
+          description: movie selects kind=movie; tv selects season and episode jobs.
+          schema: { type: string, enum: [movie, tv] }
+        - name: tmdbId
+          in: query
+          schema: { type: integer, minimum: 1 }
+        - name: seasonNumber
+          in: query
+          schema: { type: integer, minimum: 0 }
+        - name: episodeNumber
+          in: query
+          schema: { type: integer, minimum: 1 }
+      responses:
+        '200':
+          description: Jobs owned by the current user, suitable for rehydration.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/Acquisition' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /v1/acquisitions/{acquisitionId}:
+    parameters:
+      - name: acquisitionId
+        in: path
+        required: true
+        schema: { type: string }
+    get:
+      operationId: getAcquisition
+      responses:
+        '200':
+          description: Canonical acquisition state
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Acquisition' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /v1/acquisitions/{acquisitionId}/cancel:
+    parameters:
+      - name: acquisitionId
+        in: path
+        required: true
+        schema: { type: string }
+    post:
+      operationId: cancelAcquisition
+      description: >-
+        Cancellation is naturally idempotent once the job is cancelled and is
+        serialized by the BFF. It is refused while dispatch outcome is unknown,
+        because releasing that lock could cause a duplicate download.
+      responses:
+        '200':
+          description: Cancelled or already cancelled
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Acquisition' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+  /v1/hooks/{source}:
+    post:
+      security:
+        - webhookSecret: []
+      operationId: receiveArrWebhook
+      description: Optional Radarr/Sonarr Connect wake-up; payload is not authoritative.
+      parameters:
+        - name: source
+          in: path
+          required: true
+          schema: { type: string, enum: [radarr, sonarr] }
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { type: object, additionalProperties: true }
+      responses:
+        '202': { description: Reconciliation requested }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+components:
+  securitySchemes:
+    bffSession:
+      type: http
+      scheme: bearer
+      bearerFormat: opaque
+    jellyfinToken:
+      type: apiKey
+      in: header
+      name: X-Jellyfin-Token
+    webhookSecret:
+      type: apiKey
+      in: header
+      name: X-Wholphin-Webhook-Secret
+  parameters:
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      schema: { type: string, minLength: 16, maxLength: 128 }
+  schemas:
+    SubjectKind:
+      type: string
+      enum: [movie, season, episode]
+    Subject:
+      type: object
+      additionalProperties: false
+      required: [kind, tmdbId]
+      properties:
+        kind: { $ref: '#/components/schemas/SubjectKind' }
+        tmdbId:
+          type: integer
+          minimum: 1
+          description: Movie TMDb ID, or series TMDb ID for season/episode.
+        tvdbId:
+          type: integer
+          minimum: 1
+          description: Recommended for Sonarr; required if deployed Sonarr cannot map tmdb terms.
+        seasonNumber: { type: integer, minimum: 0 }
+        episodeNumber: { type: integer, minimum: 1 }
+    Session:
+      type: object
+      additionalProperties: false
+      required: [token, expiresAt, user]
+      properties:
+        token: { type: string }
+        expiresAt: { type: string, format: date-time }
+        user:
+          type: object
+          required: [id, name, canRequestMovies, canRequestSeries, canCancel]
+          properties:
+            id: { type: string }
+            name: { type: string }
+            canRequestMovies: { type: boolean }
+            canRequestSeries: { type: boolean }
+            canCancel: { type: boolean }
+    ReleaseSearch:
+      type: object
+      additionalProperties: false
+      required: [searchId, subject, state, expiresAt, releases]
+      properties:
+        searchId: { type: string }
+        subject: { $ref: '#/components/schemas/Subject' }
+        state:
+          type: string
+          enum: [pending, running, completed, failed, expired]
+        expiresAt: { type: string, format: date-time }
+        releases:
+          type: array
+          items: { $ref: '#/components/schemas/Release' }
+        error: { $ref: '#/components/schemas/ErrorBody' }
+    Release:
+      type: object
+      additionalProperties: false
+      required: [token, title, sizeBytes, quality, indexer, protocol, approved, rejections, expiresAt]
+      properties:
+        token: { type: string, description: Opaque, short-lived and single-consumption token. }
+        title: { type: string }
+        sizeBytes: { type: integer, format: int64, minimum: 0 }
+        seeders: { type: [integer, 'null'], minimum: 0 }
+        protocol: { type: string, enum: [torrent, usenet, unknown] }
+        quality: { type: string }
+        indexer: { type: string }
+        approved: { type: boolean }
+        rejected: { type: boolean, default: false }
+        rejections:
+          type: array
+          items: { type: string }
+        fullSeason: { type: boolean, default: false }
+        seasonNumber: { type: [integer, 'null'], minimum: 0 }
+        episodeNumbers:
+          type: array
+          items: { type: integer, minimum: 1 }
+        expiresAt: { type: string, format: date-time }
+    AcquisitionState:
+      type: string
+      enum:
+        - dispatching
+        - dispatch_uncertain
+        - queued
+        - downloading
+        - download_blocked
+        - verifying
+        - importing
+        - import_failed
+        - imported
+        - waiting_jellyfin
+        - available
+        - cancelled
+        - error
+    Acquisition:
+      type: object
+      additionalProperties: false
+      required: [id, subject, state, title, updatedAt]
+      properties:
+        id: { type: string }
+        subject: { $ref: '#/components/schemas/Subject' }
+        state: { $ref: '#/components/schemas/AcquisitionState' }
+        title: { type: string }
+        progress: { type: [number, 'null'], minimum: 0, maximum: 100 }
+        bytesDownloaded: { type: [integer, 'null'], format: int64, minimum: 0 }
+        bytesTotal: { type: [integer, 'null'], format: int64, minimum: 0 }
+        downloadSpeedBytesPerSecond: { type: [integer, 'null'], format: int64, minimum: 0 }
+        etaSeconds: { type: [integer, 'null'], format: int64, minimum: 0 }
+        statusText: { type: [string, 'null'] }
+        progressSource: { type: [string, 'null'], enum: [arr, qbittorrent, null] }
+        error: { $ref: '#/components/schemas/ErrorBody' }
+        jellyfinItemId: { type: [string, 'null'] }
+        updatedAt: { type: string, format: date-time }
+    ErrorBody:
+      type: object
+      additionalProperties: false
+      required: [code, message, retryable]
+      properties:
+        code: { type: string }
+        message: { type: string }
+        retryable: { type: boolean }
+        requestId: { type: string }
+    ErrorEnvelope:
+      type: object
+      required: [error]
+      properties:
+        error: { $ref: '#/components/schemas/ErrorBody' }
+  responses:
+    BadRequest: { description: Invalid request, content: { application/json: { schema: { $ref: '#/components/schemas/ErrorEnvelope' } } } }
+    Unauthorized: { description: Missing, invalid or expired credential, content: { application/json: { schema: { $ref: '#/components/schemas/ErrorEnvelope' } } } }
+    Forbidden: { description: Authenticated user lacks BFF permission, content: { application/json: { schema: { $ref: '#/components/schemas/ErrorEnvelope' } } } }
+    NotFound: { description: Resource not found or not owned by this user, content: { application/json: { schema: { $ref: '#/components/schemas/ErrorEnvelope' } } } }
+    Conflict: { description: Idempotency conflict or incompatible state, content: { application/json: { schema: { $ref: '#/components/schemas/ErrorEnvelope' } } } }
+    Expired: { description: Selection or search expired; search again, content: { application/json: { schema: { $ref: '#/components/schemas/ErrorEnvelope' } } } }
+    Unprocessable: { description: Release rejected or series mapping unavailable, content: { application/json: { schema: { $ref: '#/components/schemas/ErrorEnvelope' } } } }
+    RateLimited:
+      description: Rate limit exceeded
+      headers:
+        Retry-After: { schema: { type: integer, minimum: 1 } }
+      content: { application/json: { schema: { $ref: '#/components/schemas/ErrorEnvelope' } } }
+    BadGateway: { description: Invalid response from an upstream service, content: { application/json: { schema: { $ref: '#/components/schemas/ErrorEnvelope' } } } }
+    ServiceUnavailable: { description: Required upstream unavailable, content: { application/json: { schema: { $ref: '#/components/schemas/ErrorEnvelope' } } } }
+    GatewayTimeout: { description: Upstream timeout; dispatch may require reconciliation, content: { application/json: { schema: { $ref: '#/components/schemas/ErrorEnvelope' } } } }

@@ -1,0 +1,44 @@
+services:
+  companion:
+    build:
+      context: .
+    restart: unless-stopped
+    stop_grace_period: 40s
+    env_file:
+      - .env
+    environment:
+      BFF_DATA_KEY_FILE: /run/secrets/bff_data_key
+      RADARR_API_KEY_FILE: /run/secrets/radarr_api_key
+      SONARR_API_KEY_FILE: /run/secrets/sonarr_api_key
+      JELLYFIN_API_KEY_FILE: /run/secrets/jellyfin_api_key
+    secrets:
+      - bff_data_key
+      - radarr_api_key
+      - sonarr_api_key
+      - jellyfin_api_key
+    volumes:
+      - companion-data:/data
+    ports:
+      - 127.0.0.1:8090:8090
+    networks:
+      - media-backend
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+volumes:
+  companion-data:
+
+networks:
+  media-backend:
+    external: true
+
+secrets:
+  bff_data_key: { file: ./secrets/bff_data_key }
+  radarr_api_key: { file: ./secrets/radarr_api_key }
+  sonarr_api_key: { file: ./secrets/sonarr_api_key }
+  jellyfin_api_key: { file: ./secrets/jellyfin_api_key }

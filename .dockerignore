@@ -1,0 +1,12 @@
+.git
+.github
+.env
+.env.*
+secrets
+*.db
+*.db-*
+*.sqlite
+*.sqlite-*
+bin
+coverage
+coverage.out

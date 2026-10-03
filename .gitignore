@@ -1,0 +1,11 @@
+.env
+.env.*
+!.env.example
+*.db
+*.db-*
+*.sqlite
+*.sqlite-*
+bin/
+coverage/
+coverage.out
+secrets/
