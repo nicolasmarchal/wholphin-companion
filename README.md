@@ -1,7 +1,7 @@
 # Wholphin Companion
 
-License: GPL-2.0-only. This is an independent repository from Wholphin; its
-module path is provisional until the final repository URL is assigned.
+License: GPL-2.0-only. This is an independent repository from Wholphin. Its
+canonical module and repository are `github.com/nicolasmarchal/wholphin-companion`.
 
 `companion` is the optional, LAN-side backend for interactive release selection.
 It keeps Radarr, Sonarr, Jellyfin and qBittorrent credentials off the Android
