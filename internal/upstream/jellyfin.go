@@ -210,6 +210,10 @@ func (c *JellyfinClient) do(ctx context.Context, method, path string, query url.
 		return err
 	}
 	req.Header.Set("Accept", "application/json")
+	escapedToken := strings.NewReplacer(`\`, `\\`, `"`, `\"`).Replace(token)
+	req.Header.Set("Authorization", `MediaBrowser Token="`+escapedToken+`"`)
+	// Retain the legacy header for older Jellyfin versions while using the
+	// MediaBrowser authorization format required by current servers.
 	req.Header.Set("X-Emby-Token", token)
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")

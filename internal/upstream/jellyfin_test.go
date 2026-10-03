@@ -22,6 +22,9 @@ func TestJellyfinAvailabilityUsesExplicitUserAndPlaybackInfo(t *testing.T) {
 		if r.Header.Get("X-Emby-Token") != "server-key" {
 			t.Error("missing server-side credential")
 		}
+		if r.Header.Get("Authorization") != `MediaBrowser Token="server-key"` {
+			t.Error("missing MediaBrowser authorization")
+		}
 		_, _ = io.WriteString(w, `{"Items":[{"Id":"movie-item","ProviderIds":{"Tmdb":"42"}}]}`)
 	})
 	mux.HandleFunc("POST /Items/movie-item/PlaybackInfo", func(w http.ResponseWriter, r *http.Request) {
