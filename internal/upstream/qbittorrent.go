@@ -59,6 +59,12 @@ func (c *QBittorrentClient) Stats(ctx context.Context, hash string) (domain.Torr
 }
 
 func (c *QBittorrentClient) ensureLogin(ctx context.Context) error {
+	// A qBittorrent deployment may explicitly exempt the Companion host through
+	// WebUI\AuthSubnetWhitelist. In that case requests are authenticated by their
+	// network origin and no reusable WebUI password needs to be stored here.
+	if c.username == "" && c.password == "" {
+		return nil
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.loggedIn {

@@ -65,20 +65,21 @@ type ResolvedSubject struct {
 }
 
 type Release struct {
-	Token            string    `json:"token"`
-	Title            string    `json:"title"`
-	SizeBytes        int64     `json:"sizeBytes"`
-	Seeders          *int      `json:"seeders"`
-	Quality          string    `json:"quality"`
-	Indexer          string    `json:"indexer"`
-	Protocol         string    `json:"protocol"`
-	Approved         bool      `json:"approved"`
-	Rejected         bool      `json:"rejected"`
-	RejectionReasons []string  `json:"rejections"`
-	FullSeason       bool      `json:"fullSeason,omitempty"`
-	SeasonNumber     *int      `json:"seasonNumber,omitempty"`
-	EpisodeNumbers   []int     `json:"episodeNumbers,omitempty"`
-	ExpiresAt        time.Time `json:"expiresAt"`
+	Token                 string    `json:"token"`
+	Title                 string    `json:"title"`
+	SizeBytes             int64     `json:"sizeBytes"`
+	Seeders               *int      `json:"seeders"`
+	Quality               string    `json:"quality"`
+	Indexer               string    `json:"indexer"`
+	Protocol              string    `json:"protocol"`
+	Approved              bool      `json:"approved"`
+	Rejected              bool      `json:"rejected"`
+	PolicyOverrideAllowed bool      `json:"policyOverrideAllowed"`
+	RejectionReasons      []string  `json:"rejections"`
+	FullSeason            bool      `json:"fullSeason,omitempty"`
+	SeasonNumber          *int      `json:"seasonNumber,omitempty"`
+	EpisodeNumbers        []int     `json:"episodeNumbers,omitempty"`
+	ExpiresAt             time.Time `json:"expiresAt"`
 }
 
 type Candidate struct {

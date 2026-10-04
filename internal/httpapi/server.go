@@ -5,10 +5,12 @@ import (
 	"crypto/subtle"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
 	"net/http"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -22,11 +24,12 @@ import (
 )
 
 type Server struct {
-	app           *app.App
-	log           *slog.Logger
-	webhookSecret string
-	limiter       *limiter
-	urls          *http.ServeMux
+	app             *app.App
+	log             *slog.Logger
+	webhookSecret   string
+	limiter         *limiter
+	urls            *http.ServeMux
+	streamHeartbeat time.Duration
 }
 
 type errorBody struct {
@@ -67,7 +70,17 @@ type acquisitionResponse struct {
 }
 
 func New(application *app.App, logger *slog.Logger, webhookSecret string) http.Handler {
-	s := &Server{app: application, log: logger, webhookSecret: webhookSecret, limiter: newLimiter(), urls: http.NewServeMux()}
+	return newHandler(application, logger, webhookSecret, 15*time.Second)
+}
+
+func newHandler(application *app.App, logger *slog.Logger, webhookSecret string, streamHeartbeat time.Duration) http.Handler {
+	if streamHeartbeat <= 0 {
+		streamHeartbeat = 15 * time.Second
+	}
+	s := &Server{
+		app: application, log: logger, webhookSecret: webhookSecret,
+		limiter: newLimiter(), urls: http.NewServeMux(), streamHeartbeat: streamHeartbeat,
+	}
 	s.routes()
 	return s.securityHeaders(s.urls)
 }
@@ -84,6 +97,7 @@ func (s *Server) routes() {
 	s.urls.Handle("POST /v1/acquisitions", s.authenticated(s.acquire))
 	s.urls.Handle("GET /v1/acquisitions", s.authenticated(s.listAcquisitions))
 	s.urls.Handle("GET /v1/acquisitions/{acquisitionId}", s.authenticated(s.getAcquisition))
+	s.urls.Handle("GET /v1/acquisitions/{acquisitionId}/events", s.authenticated(s.streamAcquisition))
 	s.urls.Handle("POST /v1/acquisitions/{acquisitionId}/cancel", s.authenticated(s.cancelAcquisition))
 	s.urls.HandleFunc("POST /v1/hooks/{source}", s.webhook)
 }
@@ -233,6 +247,96 @@ func (s *Server) getAcquisition(w http.ResponseWriter, r *http.Request, user dom
 		return
 	}
 	s.writeJSON(w, http.StatusOK, toAcquisition(job, r))
+}
+
+func (s *Server) streamAcquisition(w http.ResponseWriter, r *http.Request, user domain.User, token string) {
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		s.writeError(w, r, http.StatusInternalServerError, "streaming_unsupported", "Streaming is not supported by this server", false)
+		return
+	}
+
+	// Capture the broadcast edge before reading the canonical snapshot. A
+	// concurrent commit therefore either appears in the snapshot or wakes the
+	// loop, while reconnects never need a durable telemetry replay queue.
+	signal := s.app.JobChangeSignal()
+	job, err := s.app.Job(r.Context(), user, r.PathValue("acquisitionId"))
+	if err != nil {
+		s.handleError(w, r, err)
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache, no-transform")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Accel-Buffering", "no")
+	refreshStreamWriteDeadline(w)
+	w.WriteHeader(http.StatusOK)
+	if _, err = io.WriteString(w, "retry: 2000\n\n"); err != nil {
+		return
+	}
+	last := toAcquisition(job, r)
+	if err = writeAcquisitionEvent(w, job.Version, last); err != nil {
+		return
+	}
+	flusher.Flush()
+
+	heartbeat := time.NewTicker(s.streamHeartbeat)
+	defer heartbeat.Stop()
+
+	for {
+		select {
+		case <-r.Context().Done():
+			return
+		case <-signal:
+			// Capture the replacement edge before reading. A second racing update
+			// then closes this new channel and is observed on the next iteration.
+			signal = s.app.JobChangeSignal()
+			updated, eventErr := s.app.Job(r.Context(), user, job.ID)
+			if eventErr != nil {
+				if !errors.Is(eventErr, store.ErrNotFound) {
+					s.log.Error("read streamed acquisition", "job_id", job.ID, "request_id", requestID(r), "error", eventErr)
+				}
+				return
+			}
+			next := toAcquisition(updated, r)
+			job = updated
+			if reflect.DeepEqual(last, next) {
+				continue
+			}
+			refreshStreamWriteDeadline(w)
+			if err = writeAcquisitionEvent(w, job.Version, next); err != nil {
+				return
+			}
+			last = next
+			flusher.Flush()
+		case <-heartbeat.C:
+			if _, err = s.app.Authenticate(r.Context(), token); err != nil {
+				return
+			}
+			refreshStreamWriteDeadline(w)
+			if _, err = io.WriteString(w, ": keep-alive\n\n"); err != nil {
+				return
+			}
+			flusher.Flush()
+		}
+	}
+}
+
+func refreshStreamWriteDeadline(w http.ResponseWriter) {
+	// The process-wide server keeps a finite WriteTimeout for ordinary JSON
+	// requests. Extend it on every SSE frame so a healthy long-lived stream is
+	// not cut off, while a client that stops reading is still bounded.
+	_ = http.NewResponseController(w).SetWriteDeadline(time.Now().Add(30 * time.Second))
+}
+
+func writeAcquisitionEvent(w io.Writer, version int64, acquisition acquisitionResponse) error {
+	payload, err := json.Marshal(acquisition)
+	if err != nil {
+		return err
+	}
+	_, err = fmt.Fprintf(w, "id: %d\nevent: acquisition\ndata: %s\n\n", version, payload)
+	return err
 }
 
 func (s *Server) listAcquisitions(w http.ResponseWriter, r *http.Request, user domain.User, _ string) {

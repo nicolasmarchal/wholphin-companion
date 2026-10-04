@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"reflect"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -23,14 +24,16 @@ var (
 )
 
 type Options struct {
-	SessionTTL      time.Duration
-	SelectionTTL    time.Duration
-	SearchTimeout   time.Duration
-	UpstreamTimeout time.Duration
-	ReconcileEvery  time.Duration
-	AllowedUsers    map[string]struct{}
-	AllowAllUsers   bool
-	AllowCancel     bool
+	SessionTTL       time.Duration
+	SelectionTTL     time.Duration
+	SearchTimeout    time.Duration
+	UpstreamTimeout  time.Duration
+	ReconcileEvery   time.Duration
+	ProgressEvery    time.Duration
+	ReconcileWorkers int
+	AllowedUsers     map[string]struct{}
+	AllowAllUsers    bool
+	AllowCancel      bool
 }
 
 type App struct {
@@ -55,6 +58,18 @@ type Session struct {
 }
 
 func New(st *store.Store, radarr, sonarr domain.Arr, jellyfin domain.Jellyfin, qb domain.QBittorrent, options Options, logger *slog.Logger) *App {
+	if options.ReconcileEvery <= 0 {
+		options.ReconcileEvery = 10 * time.Second
+	}
+	if options.ProgressEvery <= 0 || options.ProgressEvery > options.ReconcileEvery {
+		options.ProgressEvery = options.ReconcileEvery
+	}
+	if options.ReconcileWorkers <= 0 {
+		options.ReconcileWorkers = 4
+	} else if options.ReconcileWorkers > 32 {
+		options.ReconcileWorkers = 32
+	}
+	options.AllowedUsers = canonicalUserSet(options.AllowedUsers)
 	return &App{
 		store: st, radarr: radarr, sonarr: sonarr, jellyfin: jellyfin, qbittorrent: qb,
 		options: options, log: logger, now: func() time.Time { return time.Now().UTC() },
@@ -82,7 +97,7 @@ func (a *App) ExchangeSession(ctx context.Context, jellyfinToken string) (Sessio
 		return Session{}, err
 	}
 	if !a.options.AllowAllUsers {
-		if _, ok := a.options.AllowedUsers[user.ID]; !ok {
+		if _, ok := a.options.AllowedUsers[canonicalUserID(user.ID)]; !ok {
 			return Session{}, ErrForbidden
 		}
 	}
@@ -113,12 +128,29 @@ func (a *App) Authenticate(ctx context.Context, token string) (domain.User, erro
 		return domain.User{}, err
 	}
 	if !a.options.AllowAllUsers {
-		if _, allowed := a.options.AllowedUsers[user.ID]; !allowed {
+		if _, allowed := a.options.AllowedUsers[canonicalUserID(user.ID)]; !allowed {
 			_ = a.store.RevokeSession(ctx, hash)
 			return domain.User{}, ErrForbidden
 		}
 	}
 	return user, nil
+}
+
+func canonicalUserSet(users map[string]struct{}) map[string]struct{} {
+	canonical := make(map[string]struct{}, len(users))
+	for userID := range users {
+		if userID = canonicalUserID(userID); userID != "" {
+			canonical[userID] = struct{}{}
+		}
+	}
+	return canonical
+}
+
+func canonicalUserID(userID string) string {
+	// Jellyfin may expose the same UUID in compact or hyphenated form depending
+	// on whether it came from the HTTP API, SDK, or database.
+	userID = strings.ToLower(strings.TrimSpace(userID))
+	return strings.ReplaceAll(userID, "-", "")
 }
 
 func (a *App) Revoke(ctx context.Context, token string) error {
@@ -216,6 +248,8 @@ func (a *App) failDispatch(ctx context.Context, job domain.Job, code, message st
 func (a *App) Job(ctx context.Context, user domain.User, id string) (domain.Job, error) {
 	return a.store.Job(ctx, id, user.ID)
 }
+
+func (a *App) JobChangeSignal() <-chan struct{} { return a.store.JobChangeSignal() }
 
 func (a *App) Jobs(ctx context.Context, user domain.User, subject *domain.Subject, mediaType string, active bool) ([]domain.Job, error) {
 	return a.store.Jobs(ctx, user.ID, subject, mediaType, active)
@@ -363,7 +397,9 @@ func (a *App) runOneSearch(parent context.Context) bool {
 }
 
 func (a *App) reconcileLoop(ctx context.Context) {
-	ticker := time.NewTicker(a.options.ReconcileEvery)
+	// The fast ticker only makes due progress jobs responsive. Other phases keep
+	// their independently persisted reconciliation/backoff schedule.
+	ticker := time.NewTicker(a.options.ProgressEvery)
 	defer ticker.Stop()
 	cleanup := time.NewTicker(time.Hour)
 	defer cleanup.Stop()
@@ -387,9 +423,35 @@ func (a *App) reconcile(ctx context.Context, force bool) {
 		a.log.Error("list active acquisitions", "error", err)
 		return
 	}
-	for _, job := range jobs {
-		a.reconcileJob(ctx, job)
+	workerCount := a.options.ReconcileWorkers
+	if workerCount > len(jobs) {
+		workerCount = len(jobs)
 	}
+	if workerCount == 0 {
+		return
+	}
+	queue := make(chan domain.Job)
+	var workers sync.WaitGroup
+	workers.Add(workerCount)
+	for range workerCount {
+		go func() {
+			defer workers.Done()
+			for job := range queue {
+				a.reconcileJob(ctx, job)
+			}
+		}()
+	}
+	for _, job := range jobs {
+		select {
+		case queue <- job:
+		case <-ctx.Done():
+			close(queue)
+			workers.Wait()
+			return
+		}
+	}
+	close(queue)
+	workers.Wait()
 }
 
 func (a *App) reconcileJob(parent context.Context, job domain.Job) {
@@ -488,7 +550,15 @@ func (a *App) scheduleNextPoll(job *domain.Job, previous domain.Job) {
 	materialBefore.PollAttempt, materialAfter.PollAttempt = 0, 0
 	materialBefore.NextPollAt, materialAfter.NextPollAt = time.Time{}, time.Time{}
 	materialBefore.Version, materialAfter.Version = 0, 0
-	if reflect.DeepEqual(materialBefore, materialAfter) {
+	if continuousProgressJob(*job) {
+		// Even an identical sample can mean the transfer is between torrent
+		// updates. Leave the job due so the next reconciliation tick samples it;
+		// scheduling it one full interval from the end of this pass would skip the
+		// next tick and effectively double the configured progress cadence.
+		job.PollAttempt = 0
+		job.NextPollAt = a.now()
+		return
+	} else if reflect.DeepEqual(materialBefore, materialAfter) {
 		job.PollAttempt = previous.PollAttempt + 1
 	} else {
 		job.PollAttempt = 0
@@ -512,6 +582,13 @@ func (a *App) scheduleNextPoll(job *domain.Job, previous domain.Job) {
 		delay = delay - jitterWindow/2 + time.Duration(digest[0])*jitterWindow/255
 	}
 	job.NextPollAt = a.now().Add(delay)
+}
+
+func continuousProgressJob(job domain.Job) bool {
+	if job.ErrorCode != "" {
+		return false
+	}
+	return job.State == domain.Queued || job.State == domain.Downloading || job.State == domain.Verifying
 }
 
 func publicTorrentState(state string) string {

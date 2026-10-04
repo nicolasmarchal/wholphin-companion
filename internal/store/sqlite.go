@@ -30,9 +30,11 @@ var (
 )
 
 type Store struct {
-	db        *sql.DB
-	sealer    *secure.Sealer
-	reserveMu sync.Mutex
+	db           *sql.DB
+	sealer       *secure.Sealer
+	reserveMu    sync.Mutex
+	changeMu     sync.Mutex
+	changeSignal chan struct{}
 }
 
 type ReservedJob struct {
@@ -70,7 +72,7 @@ func Open(path string, sealer *secure.Sealer) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("sqlite migration: %w", err)
 	}
-	const currentSchemaVersion = 1
+	const currentSchemaVersion = 2
 	var schemaVersion int
 	if err = db.QueryRowContext(ctx, `SELECT COALESCE(MAX(version),0) FROM schema_migrations`).Scan(&schemaVersion); err != nil {
 		db.Close()
@@ -79,6 +81,24 @@ func Open(path string, sealer *secure.Sealer) (*Store, error) {
 	if schemaVersion > currentSchemaVersion {
 		db.Close()
 		return nil, fmt.Errorf("database schema version %d is newer than supported version %d", schemaVersion, currentSchemaVersion)
+	}
+	if schemaVersion < 2 {
+		tx, migrationErr := db.BeginTx(ctx, nil)
+		if migrationErr == nil {
+			_, migrationErr = tx.ExecContext(ctx, `ALTER TABLE release_candidates ADD COLUMN policy_override_allowed INTEGER NOT NULL DEFAULT 0`)
+		}
+		if migrationErr == nil {
+			_, migrationErr = tx.ExecContext(ctx, `INSERT INTO schema_migrations(version,applied_at) VALUES(2,?)`, time.Now().UTC().Unix())
+		}
+		if migrationErr == nil {
+			migrationErr = tx.Commit()
+		} else if tx != nil {
+			_ = tx.Rollback()
+		}
+		if migrationErr != nil {
+			db.Close()
+			return nil, fmt.Errorf("sqlite migration v2: %w", migrationErr)
+		}
 	}
 	if _, err = db.ExecContext(ctx, `INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(?,?)`, currentSchemaVersion, time.Now().UTC().Unix()); err != nil {
 		db.Close()
@@ -105,7 +125,7 @@ WHERE state='dispatching'`, time.Now().UTC().Unix()); err != nil {
 		db.Close()
 		return nil, err
 	}
-	return &Store{db: db, sealer: sealer}, nil
+	return &Store{db: db, sealer: sealer, changeSignal: make(chan struct{})}, nil
 }
 
 func (s *Store) Close() error { return s.db.Close() }
@@ -222,11 +242,11 @@ func (s *Store) CompleteSearch(ctx context.Context, searchID string, resolved do
 		candidateExpected, _ := json.Marshal(candidate.ExpectedEpisodes)
 		_, err = tx.ExecContext(ctx, `
 INSERT INTO release_candidates(id,search_id,token_hash,token_cipher,payload_cipher,title,size_bytes,seeders,
- quality,indexer_name,protocol,approved,rejected,rejections_json,full_season,release_season_number,
+ quality,indexer_name,protocol,approved,rejected,policy_override_allowed,rejections_json,full_season,release_season_number,
  episode_numbers_json,expected_episodes_json,expires_at)
-VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, id, searchID, secure.Hash(candidate.Token), tokenCipher,
+VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, id, searchID, secure.Hash(candidate.Token), tokenCipher,
 			payloadCipher, candidate.Title, candidate.SizeBytes, candidate.Seeders, candidate.Quality,
-			candidate.Indexer, candidate.Protocol, candidate.Approved, candidate.Rejected, string(rejections),
+			candidate.Indexer, candidate.Protocol, candidate.Approved, candidate.Rejected, candidate.PolicyOverrideAllowed, string(rejections),
 			candidate.FullSeason, candidate.SeasonNumber, string(episodes), string(candidateExpected), expires.Unix())
 		if err != nil {
 			return err
@@ -272,7 +292,7 @@ FROM release_searches WHERE id=? AND user_id=?`, id, userID)
 	}
 	rows, err := s.db.QueryContext(ctx, `
 SELECT id,token_cipher,title,size_bytes,seeders,quality,indexer_name,protocol,approved,rejected,
- rejections_json,full_season,release_season_number,episode_numbers_json,expires_at
+ policy_override_allowed,rejections_json,full_season,release_season_number,episode_numbers_json,expires_at
 FROM release_candidates WHERE search_id=? AND consumed_job_id IS NULL ORDER BY rejected,title`, id)
 	if err != nil {
 		return search, err
@@ -284,11 +304,11 @@ FROM release_candidates WHERE search_id=? AND consumed_job_id IS NULL ORDER BY r
 		var tokenCipher []byte
 		var seeders sql.NullInt64
 		var season sql.NullInt64
-		var approved, rejected, full int
+		var approved, rejected, policyOverrideAllowed, full int
 		var rejections, episodes string
 		var expires int64
 		if err = rows.Scan(&candidateID, &tokenCipher, &release.Title, &release.SizeBytes, &seeders,
-			&release.Quality, &release.Indexer, &release.Protocol, &approved, &rejected, &rejections,
+			&release.Quality, &release.Indexer, &release.Protocol, &approved, &rejected, &policyOverrideAllowed, &rejections,
 			&full, &season, &episodes, &expires); err != nil {
 			return search, err
 		}
@@ -297,7 +317,7 @@ FROM release_candidates WHERE search_id=? AND consumed_job_id IS NULL ORDER BY r
 			return search, err
 		}
 		release.Token = string(token)
-		release.Approved, release.Rejected, release.FullSeason = approved != 0, rejected != 0, full != 0
+		release.Approved, release.Rejected, release.PolicyOverrideAllowed, release.FullSeason = approved != 0, rejected != 0, policyOverrideAllowed != 0, full != 0
 		if seeders.Valid {
 			v := int(seeders.Int64)
 			release.Seeders = &v
@@ -342,15 +362,15 @@ func (s *Store) ReserveJob(ctx context.Context, userID, selectionToken, idemKey 
 	var consumed sql.NullString
 	var tmdbID, tvdbID, arrItemID, arrEpisodeID int
 	var season, episode sql.NullInt64
-	var approved, rejected int
+	var approved, rejected, policyOverrideAllowed int
 	var expires int64
 	err = tx.QueryRowContext(ctx, `
 SELECT c.id,c.payload_cipher,c.title,c.indexer_name,c.approved,c.rejected,c.expires_at,c.consumed_job_id,s.backend,s.kind,s.tmdb_id,
- s.tvdb_id,s.season_number,s.episode_number,s.arr_item_id,s.arr_episode_id,c.expected_episodes_json
+ s.tvdb_id,s.season_number,s.episode_number,s.arr_item_id,s.arr_episode_id,c.expected_episodes_json,c.policy_override_allowed
 FROM release_candidates c JOIN release_searches s ON s.id=c.search_id
 WHERE c.token_hash=? AND s.user_id=?`, secure.Hash(selectionToken), userID).
 		Scan(&candidateID, &payloadCipher, &title, &candidateIndexer, &approved, &rejected, &expires, &consumed, &backend, &kind,
-			&tmdbID, &tvdbID, &season, &episode, &arrItemID, &arrEpisodeID, &expectedJSON)
+			&tmdbID, &tvdbID, &season, &episode, &arrItemID, &arrEpisodeID, &expectedJSON, &policyOverrideAllowed)
 	if errors.Is(err, sql.ErrNoRows) {
 		return ReservedJob{}, ErrNotFound
 	}
@@ -360,7 +380,7 @@ WHERE c.token_hash=? AND s.user_id=?`, secure.Hash(selectionToken), userID).
 	if expires <= now.Unix() {
 		return ReservedJob{}, ErrExpired
 	}
-	if rejected != 0 || approved == 0 {
+	if (rejected != 0 || approved == 0) && policyOverrideAllowed == 0 {
 		return ReservedJob{}, ErrRejected
 	}
 	if consumed.Valid {
@@ -555,6 +575,7 @@ func (s *Store) UpdateJob(ctx context.Context, job domain.Job, eventType string,
 		return nil
 	}
 	materialChanged := !sameObservableJob(current, job)
+	auditChanged := !sameAuditJob(current, job)
 	storedUpdatedAt := current.UpdatedAt
 	if materialChanged {
 		storedUpdatedAt = now
@@ -579,14 +600,20 @@ UPDATE jobs SET state=?,version=version+1,poll_attempt=?,next_poll_at=?,arr_queu
 			return err
 		}
 	}
-	if materialChanged {
+	if auditChanged {
 		job.UpdatedAt = now
 		payload, _ := json.Marshal(job)
 		if _, err = tx.ExecContext(ctx, `INSERT INTO events(user_id,job_id,event_type,payload_json,created_at) VALUES(?,?,?,?,?)`, job.UserID, job.ID, eventType, string(payload), now.Unix()); err != nil {
 			return err
 		}
 	}
-	return tx.Commit()
+	if err = tx.Commit(); err != nil {
+		return err
+	}
+	if materialChanged {
+		s.notifyJobChange()
+	}
+	return nil
 }
 
 func (s *Store) Events(ctx context.Context, userID string, after int64, limit int) ([]Event, error) {
@@ -606,6 +633,23 @@ func (s *Store) Events(ctx context.Context, userID string, after int64, limit in
 	return events, rows.Err()
 }
 
+// JobChangeSignal is an in-memory broadcast edge. Callers capture the channel
+// before reading canonical jobs; every material commit closes the current
+// channel and replaces it so all live streams wake without creating an audit
+// event for every speed or ETA sample.
+func (s *Store) JobChangeSignal() <-chan struct{} {
+	s.changeMu.Lock()
+	defer s.changeMu.Unlock()
+	return s.changeSignal
+}
+
+func (s *Store) notifyJobChange() {
+	s.changeMu.Lock()
+	close(s.changeSignal)
+	s.changeSignal = make(chan struct{})
+	s.changeMu.Unlock()
+}
+
 func (s *Store) Cleanup(ctx context.Context, now time.Time) error {
 	_, err := s.db.ExecContext(ctx, `DELETE FROM auth_sessions WHERE expires_at<=?`, now.Unix())
 	if err != nil {
@@ -622,8 +666,8 @@ func (s *Store) Cleanup(ctx context.Context, now time.Time) error {
 	if err != nil {
 		return err
 	}
-	// Polling is canonical in the MVP; events are a bounded audit trail, not an
-	// unbounded transport queue.
+	// Audit events are deliberately coalesced; live SSE telemetry uses the
+	// in-memory change broadcast and reconnects begin with a canonical snapshot.
 	_, err = s.db.ExecContext(ctx, `DELETE FROM events WHERE created_at<=?`, now.Add(-30*24*time.Hour).Unix())
 	if err != nil {
 		return err
@@ -651,6 +695,29 @@ func sameObservableJob(left, right domain.Job) bool {
 	left.NextPollAt, right.NextPollAt = time.Time{}, time.Time{}
 	left.Version, right.Version = 0, 0
 	return sameStoredJob(left, right)
+}
+
+func sameAuditJob(left, right domain.Job) bool {
+	return left.State == right.State &&
+		left.Progress.Text == right.Progress.Text &&
+		left.Progress.Source == right.Progress.Source &&
+		progressAuditBucket(left.Progress.Percent) == progressAuditBucket(right.Progress.Percent) &&
+		left.JellyfinItemID == right.JellyfinItemID &&
+		left.ErrorCode == right.ErrorCode &&
+		left.ErrorMessage == right.ErrorMessage
+}
+
+func progressAuditBucket(percent *float64) int {
+	if percent == nil {
+		return -1
+	}
+	value := *percent
+	if value < 0 {
+		value = 0
+	} else if value > 100 {
+		value = 100
+	}
+	return int(value / 5)
 }
 
 const jobColumns = `id,user_id,kind,tmdb_id,tvdb_id,season_number,episode_number,backend,arr_item_id,

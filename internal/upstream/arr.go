@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -449,15 +450,20 @@ func parseRelease(payload json.RawMessage, resolved domain.ResolvedSubject) (dom
 	}
 	rejected := value.Rejected || len(value.Rejections) > 0
 	approved := value.Approved
+	policyOverrideAllowed := rejected && len(value.Rejections) > 0
 	rejections := make([]string, 0, len(value.Rejections)+2)
 	for _, rejection := range value.Rejections {
 		rejections = appendUnique(rejections, publicRejection(rejection))
+		if !isSoftPolicyRejection(rejection) {
+			policyOverrideAllowed = false
+		}
 	}
 	if value.Rejected && len(rejections) == 0 {
 		rejections = append(rejections, "Rejected by Arr policy")
 	}
 	if value.GUID == "" || value.IndexerID <= 0 || strings.TrimSpace(value.Indexer) == "" {
 		rejected, approved = true, false
+		policyOverrideAllowed = false
 		rejections = append(rejections, "BFF: release has no stable Arr selection identity")
 	}
 	releaseSeason := value.MappedSeasonNumber
@@ -467,29 +473,34 @@ func parseRelease(payload json.RawMessage, resolved domain.ResolvedSubject) (dom
 	if resolved.Subject.Kind == domain.Season {
 		if releaseSeason == nil || resolved.Subject.SeasonNumber == nil || *releaseSeason != *resolved.Subject.SeasonNumber {
 			rejected, approved = true, false
+			policyOverrideAllowed = false
 			rejections = append(rejections, "BFF: release season does not match the requested season")
 		}
 		if !value.FullSeason {
 			rejected, approved = true, false
+			policyOverrideAllowed = false
 			rejections = append(rejections, "BFF: release is not a full-season pack")
 		} else if !coversAll(coveredEpisodes, resolved.ExpectedEpisodes) {
 			rejected, approved = true, false
+			policyOverrideAllowed = false
 			rejections = append(rejections, "BFF: season pack does not cover all expected episodes")
 		}
 	} else if resolved.Subject.Kind == domain.Episode {
 		if releaseSeason == nil || resolved.Subject.SeasonNumber == nil || *releaseSeason != *resolved.Subject.SeasonNumber {
 			rejected, approved = true, false
+			policyOverrideAllowed = false
 			rejections = append(rejections, "BFF: release season does not match the requested episode")
 		}
 		if resolved.Subject.EpisodeNumber == nil || !coversAll(coveredEpisodes, []int{*resolved.Subject.EpisodeNumber}) {
 			rejected, approved = true, false
+			policyOverrideAllowed = false
 			rejections = append(rejections, "BFF: release does not contain the requested episode")
 		}
 	}
 	expectedForJob := append([]int(nil), coveredEpisodes...)
-	if resolved.Subject.Kind == domain.Season && !rejected {
+	if resolved.Subject.Kind == domain.Season && (!rejected || policyOverrideAllowed) {
 		expectedForJob = append([]int(nil), resolved.ExpectedEpisodes...)
-	} else if resolved.Subject.Kind == domain.Episode && !rejected {
+	} else if resolved.Subject.Kind == domain.Episode && (!rejected || policyOverrideAllowed) {
 		expectedForJob = []int{*resolved.Subject.EpisodeNumber}
 	}
 	return domain.Candidate{
@@ -497,8 +508,9 @@ func parseRelease(payload json.RawMessage, resolved domain.ResolvedSubject) (dom
 			Title: value.Title, SizeBytes: value.Size, Seeders: value.Seeders,
 			Quality: value.Quality.Quality.Name, Indexer: value.Indexer,
 			Protocol: normalizedProtocol(value.Protocol), Approved: approved,
-			Rejected:         rejected,
-			RejectionReasons: rejections, FullSeason: value.FullSeason,
+			Rejected:              rejected,
+			PolicyOverrideAllowed: policyOverrideAllowed,
+			RejectionReasons:      rejections, FullSeason: value.FullSeason,
 			SeasonNumber: releaseSeason, EpisodeNumbers: coveredEpisodes,
 		},
 		Payload: append([]byte(nil), payload...), ExpectedEpisodes: expectedForJob,
@@ -588,7 +600,12 @@ func (r queueRecord) observation() domain.Observation {
 func publicRejection(value string) string {
 	lower := strings.ToLower(value)
 	switch {
-	case strings.Contains(lower, "quality"), strings.Contains(lower, "resolution"):
+	case oversizedReleaseRejection.MatchString(value):
+		matches := oversizedReleaseRejection.FindStringSubmatch(value)
+		return fmt.Sprintf("Release size %s exceeds the configured maximum of %s", matches[1], matches[2])
+	case strings.Contains(lower, "custom format"), strings.Contains(lower, "customformat"):
+		return "Custom format policy is not met"
+	case strings.Contains(lower, "quality"), strings.Contains(lower, "resolution"), strings.Contains(lower, "cutoff"), strings.Contains(lower, "upgrade"), strings.Contains(lower, "preferred word"):
 		return "Quality does not meet the configured profile"
 	case strings.Contains(lower, "seed"):
 		return "Insufficient seeders"
@@ -602,6 +619,27 @@ func publicRejection(value string) string {
 		return "Rejected by Arr policy"
 	}
 }
+
+// isSoftPolicyRejection deliberately uses a narrow allow-list. Interactive Arr
+// grabs may bypass these preference rules, while parsing, identity and coverage
+// failures must remain non-selectable.
+func isSoftPolicyRejection(value string) bool {
+	lower := strings.ToLower(value)
+	return oversizedReleaseRejection.MatchString(value) ||
+		strings.Contains(lower, "custom format") ||
+		strings.Contains(lower, "customformat") ||
+		strings.Contains(lower, "quality") ||
+		strings.Contains(lower, "resolution") ||
+		strings.Contains(lower, "cutoff") ||
+		strings.Contains(lower, "upgrade") ||
+		strings.Contains(lower, "preferred word") ||
+		strings.Contains(lower, "seed") ||
+		strings.Contains(lower, "blocklist")
+}
+
+var oversizedReleaseRejection = regexp.MustCompile(
+	`(?i)(\d+(?:[.,]\d+)?\s*[kmgtpe]?i?b)\s+is larger than maximum allowed\s+(\d+(?:[.,]\d+)?\s*[kmgtpe]?i?b)`,
+)
 
 func appendUnique(values []string, value string) []string {
 	for _, existing := range values {

@@ -61,8 +61,10 @@ func main() {
 		app.Options{
 			SessionTTL: cfg.SessionTTL, SelectionTTL: cfg.SelectionTTL,
 			SearchTimeout: cfg.SearchTimeout, UpstreamTimeout: cfg.UpstreamTimeout,
-			ReconcileEvery: cfg.ReconcileEvery, AllowedUsers: cfg.AllowedUsers,
-			AllowAllUsers: cfg.AllowAllUsers, AllowCancel: cfg.AllowCancel,
+			ReconcileEvery: cfg.ReconcileEvery, ProgressEvery: cfg.ProgressEvery,
+			ReconcileWorkers: cfg.ReconcileWorkers,
+			AllowedUsers:     cfg.AllowedUsers,
+			AllowAllUsers:    cfg.AllowAllUsers, AllowCancel: cfg.AllowCancel,
 		},
 		logger,
 	)

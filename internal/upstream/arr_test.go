@@ -10,6 +10,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -224,6 +226,88 @@ func TestReleaseRejectionsAreProjectedWithoutSecrets(t *testing.T) {
 		if bytes.Contains(public, []byte(secret)) {
 			t.Fatalf("rejection leaked %q: %s", secret, public)
 		}
+	}
+}
+
+func TestSoftArrPolicyRejectionsRemainSelectableByExplicitOverride(t *testing.T) {
+	resolved := domain.ResolvedSubject{Subject: domain.Subject{Kind: domain.Movie, TMDBID: 1}}
+	for _, rejection := range []string{
+		"Quality is not wanted in profile",
+		"Custom format score is below minimum",
+		"Not enough seeders",
+		"Release is blocklisted",
+		"28.3 GB is larger than maximum allowed 10.6 GB (for Example)",
+	} {
+		t.Run(rejection, func(t *testing.T) {
+			candidate, err := parseRelease(json.RawMessage(`{"guid":"g","indexerId":1,"indexer":"Test","title":"Release","approved":false,"rejected":true,"rejections":[`+strconv.Quote(rejection)+`]}`), resolved)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !candidate.PolicyOverrideAllowed {
+				t.Fatalf("soft rejection was not overrideable: %#v", candidate.Release)
+			}
+		})
+	}
+}
+
+func TestOversizedReleaseRejectionIsPreciseAndSelectable(t *testing.T) {
+	resolved := domain.ResolvedSubject{Subject: domain.Subject{Kind: domain.Movie, TMDBID: 1}}
+	candidate, err := parseRelease(json.RawMessage(`{"guid":"g","indexerId":1,"indexer":"Test","title":"Release","approved":false,"rejected":true,"rejections":["28.3 GB is larger than maximum allowed 10.6 GB (for Example)"]}`), resolved)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !candidate.PolicyOverrideAllowed {
+		t.Fatalf("oversized release was not overrideable: %#v", candidate.Release)
+	}
+	want := []string{"Release size 28.3 GB exceeds the configured maximum of 10.6 GB"}
+	if !slices.Equal(candidate.RejectionReasons, want) {
+		t.Fatalf("rejections=%q want=%q", candidate.RejectionReasons, want)
+	}
+}
+
+func TestUnknownOrMixedArrRejectionsCannotBeOverridden(t *testing.T) {
+	resolved := domain.ResolvedSubject{Subject: domain.Subject{Kind: domain.Movie, TMDBID: 1}}
+	for _, raw := range []string{
+		`{"guid":"g","indexerId":1,"indexer":"Test","title":"Release","approved":false,"rejected":true}`,
+		`{"guid":"g","indexerId":1,"indexer":"Test","title":"Release","approved":false,"rejected":true,"rejections":["Not enough seeders","Unable to parse movie"]}`,
+	} {
+		candidate, err := parseRelease(json.RawMessage(raw), resolved)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if candidate.PolicyOverrideAllowed {
+			t.Fatalf("hard or ambiguous rejection became overrideable: %#v", candidate.Release)
+		}
+	}
+}
+
+func TestSubjectCoverageFailureCannotBeOverriddenBySoftArrPolicy(t *testing.T) {
+	season := 2
+	resolved := domain.ResolvedSubject{
+		Subject:          domain.Subject{Kind: domain.Season, TMDBID: 1, SeasonNumber: &season},
+		ExpectedEpisodes: []int{1, 2},
+	}
+	candidate, err := parseRelease(json.RawMessage(`{"guid":"g","indexerId":1,"indexer":"Test","title":"Wrong season","approved":false,"rejected":true,"rejections":["Not enough seeders"],"fullSeason":true,"seasonNumber":3,"episodeNumbers":[1,2]}`), resolved)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if candidate.PolicyOverrideAllowed {
+		t.Fatalf("subject mismatch became overrideable: %#v", candidate.Release)
+	}
+}
+
+func TestSoftPolicySeasonOverrideKeepsCanonicalExpectedEpisodes(t *testing.T) {
+	season := 2
+	resolved := domain.ResolvedSubject{
+		Subject:          domain.Subject{Kind: domain.Season, TMDBID: 1, SeasonNumber: &season},
+		ExpectedEpisodes: []int{1, 2},
+	}
+	candidate, err := parseRelease(json.RawMessage(`{"guid":"g","indexerId":1,"indexer":"Test","title":"Season pack","approved":false,"rejected":true,"rejections":["Quality is not wanted in profile"],"fullSeason":true,"seasonNumber":2,"episodeNumbers":[1,2,99]}`), resolved)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !candidate.PolicyOverrideAllowed || !slices.Equal(candidate.ExpectedEpisodes, resolved.ExpectedEpisodes) {
+		t.Fatalf("canonical season coverage was not retained: %#v", candidate)
 	}
 }
 

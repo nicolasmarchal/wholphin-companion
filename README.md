@@ -27,6 +27,10 @@ standard library.
 - Movies and series first created by the BFF are added unmonitored and with all
   automatic-search flags disabled. Pre-existing Arr items are left untouched.
   Only the exact cached release selected by its opaque token is posted to Arr.
+- Interactive grabs may override only allow-listed preference rejections:
+  quality/profile, custom-format score, minimum seeders and blocklist. Unknown
+  Arr rejections and every BFF identity or episode/season coverage rejection
+  remain non-selectable.
 - A timeout after an Arr grab is treated as `dispatch_uncertain`; the service
   reconciles queue/history and never blindly re-grabs. Correlation requires a
   server-only SHA-256 fingerprint of the selected Arr GUID plus a corroborator
@@ -43,11 +47,16 @@ standard library.
 - Secret-bearing HTTP clients refuse redirects. Public status text is an
   allow-listed projection; raw Arr/qBittorrent messages, paths and URLs never
   enter API responses.
-- Polling is canonical for the MVP; Arr webhooks only wake reconciliation.
-  There is no SSE stream. Unchanged jobs use durable exponential backoff with
-  stable jitter, capped at five minutes; a webhook forces an immediate pass.
-  Every upstream call remains timeout-bounded. Identical observations do not
-  append events. Audit events are retained for 30 days and terminal jobs for
+- Polling remains available as the compatibility fallback. An authenticated,
+  user-scoped SSE endpoint emits an immediate canonical acquisition snapshot
+  and then pushes coalesced canonical updates through an in-memory broadcast;
+  reconnects always start from SQLite state. Opening a stream does not bypass
+  job backoff. Arr webhooks may wake reconciliation. Healthy queued,
+  downloading, and verifying jobs use the dedicated progress cadence; slower
+  phases and errors use durable exponential backoff with stable jitter, capped
+  at five minutes. Every upstream call remains timeout-bounded. State/status/
+  error transitions and five-percent progress milestones are retained as audit
+  events for 30 days; speed and ETA samples are not. Terminal jobs remain for
   90 days.
 
 Sonarr can emit an import-history event without `downloadId` (notably some
@@ -95,6 +104,8 @@ BFF_ALLOW_CANCEL=false
 BFF_SESSION_TTL=12h
 BFF_SELECTION_TTL=10m
 BFF_RECONCILE_INTERVAL=10s
+BFF_PROGRESS_INTERVAL=2s
+BFF_RECONCILE_WORKERS=4
 BFF_WEBHOOK_SECRET=<shared Radarr/Sonarr Connect secret>
 QBITTORRENT_URL=http://qbittorrent:8080
 QBITTORRENT_USERNAME=<secret>
@@ -107,15 +118,35 @@ qBittorrent support in a private Compose override that adds the corresponding
 Keep `stop_grace_period` greater than `BFF_UPSTREAM_TIMEOUT` if either value is
 customized.
 
+`BFF_PROGRESS_INTERVAL` is the active sampling cadence for healthy queued,
+downloading, and verifying jobs. Other phases and transient upstream errors
+continue to use `BFF_RECONCILE_INTERVAL` with durable exponential backoff, so
+the faster SSE progress path does not aggressively poll Jellyfin or failed
+upstreams. `BFF_RECONCILE_WORKERS` bounds concurrent per-job upstream checks;
+one slow Arr/Jellyfin request therefore does not stall progress for every job.
+
 If `QBITTORRENT_URL` is absent, progress comes from Arr queue data. If Sonarr
 cannot resolve `tmdb:<id>` on the deployed version, clients must also send the
 series TVDb ID; Sonarr lookup must still corroborate that it belongs to the
 requested TMDb series. The BFF returns `series_mapping_required` or
 `subject_identity_mismatch` rather than guessing.
 
+When `QBITTORRENT_URL` is present, either provide both qBittorrent credentials
+or leave both empty. Empty credentials are intended only for a WebUI configured
+to bypass authentication for the Companion host's exact trusted address; never
+use a broad LAN subnet or expose that WebUI publicly. Supplying just one of the
+two credential variables is rejected at startup.
+
 Clients rehydrate with `GET /v1/acquisitions?active=true&tmdbId=...` and should
 also pass `mediaType=movie|tv` to keep the independent TMDb movie and TV
 namespaces distinct. Results are always scoped to the authenticated BFF user.
+For a live job, `GET /v1/acquisitions/{acquisitionId}/events` returns
+`text/event-stream`: every `acquisition` event carries the same JSON shape as
+the canonical acquisition GET. The first event is always a current snapshot,
+so reconnecting clients do not need to replay stale UI state. Event IDs are
+the durable per-acquisition version, not audit-log cursors. The stream
+revalidates its BFF session at every 15-second heartbeat and closes after
+expiry or revocation. Keep the GET endpoint as a transport fallback.
 
 Run locally:
 

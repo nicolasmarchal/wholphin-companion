@@ -203,6 +203,42 @@ paths:
               schema: { $ref: '#/components/schemas/Acquisition' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '404': { $ref: '#/components/responses/NotFound' }
+  /v1/acquisitions/{acquisitionId}/events:
+    parameters:
+      - name: acquisitionId
+        in: path
+        required: true
+        schema: { type: string }
+    get:
+      operationId: streamAcquisition
+      description: >-
+        Server-Sent Events stream for one user-owned acquisition. The first
+        `acquisition` event is always a fresh canonical snapshot; later events
+        are canonical SQLite snapshots triggered by an in-memory change
+        broadcast and may coalesce intermediate telemetry states. Each `data`
+        field is an Acquisition JSON object and each `id` is the durable,
+        per-acquisition row version. Reconnects start from a fresh snapshot;
+        `Last-Event-ID` is not an audit replay cursor. Heartbeat comments are
+        emitted every 15 seconds after revalidating the BFF session; expiry or
+        revocation closes the stream. Clients should keep the existing GET
+        polling endpoint as a fallback when streaming transport is unavailable.
+      responses:
+        '200':
+          description: Latest-state acquisition event stream
+          headers:
+            Cache-Control:
+              schema: { type: string, const: 'no-cache, no-transform' }
+            X-Accel-Buffering:
+              schema: { type: string, const: 'no' }
+          content:
+            text/event-stream:
+              schema:
+                type: string
+                description: >-
+                  SSE frames named `acquisition`; every data payload conforms
+                  to the Acquisition schema.
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
   /v1/acquisitions/{acquisitionId}/cancel:
     parameters:
       - name: acquisitionId
@@ -319,7 +355,7 @@ components:
     Release:
       type: object
       additionalProperties: false
-      required: [token, title, sizeBytes, quality, indexer, protocol, approved, rejections, expiresAt]
+      required: [token, title, sizeBytes, quality, indexer, protocol, approved, policyOverrideAllowed, rejections, expiresAt]
       properties:
         token: { type: string, description: Opaque, short-lived and single-consumption token. }
         title: { type: string }
@@ -330,6 +366,9 @@ components:
         indexer: { type: string }
         approved: { type: boolean }
         rejected: { type: boolean, default: false }
+        policyOverrideAllowed:
+          type: boolean
+          description: True only when every rejection is an allow-listed Arr preference rule that an interactive grab may bypass.
         rejections:
           type: array
           items: { type: string }

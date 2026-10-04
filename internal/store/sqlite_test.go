@@ -3,6 +3,7 @@ package store
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"errors"
 	"path/filepath"
 	"testing"
@@ -11,6 +12,40 @@ import (
 	"github.com/nicolasmarchal/wholphin-companion/internal/domain"
 	"github.com/nicolasmarchal/wholphin-companion/internal/secure"
 )
+
+func TestOpenMigratesVersionOneDatabase(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "v1.db")
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = db.ExecContext(ctx, schema); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = db.ExecContext(ctx, `INSERT INTO schema_migrations(version,applied_at) VALUES(1,0)`); err != nil {
+		t.Fatal(err)
+	}
+	if err = db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	sealer, err := secure.NewSealer(bytes.Repeat([]byte{8}, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	st, err := Open(path, sealer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+	var version int
+	if err = st.db.QueryRowContext(ctx, `SELECT MAX(version) FROM schema_migrations`).Scan(&version); err != nil || version != 2 {
+		t.Fatalf("schema version=%d err=%v", version, err)
+	}
+	if _, err = st.db.ExecContext(ctx, `SELECT policy_override_allowed FROM release_candidates LIMIT 1`); err != nil {
+		t.Fatalf("v2 column is missing: %v", err)
+	}
+}
 
 func TestCandidateTokensAndStrictIdempotence(t *testing.T) {
 	ctx := context.Background()
@@ -111,7 +146,7 @@ func TestRestartTurnsInFlightDispatchIntoNonReplayableUncertainty(t *testing.T) 
 	}
 	t.Cleanup(func() { _ = reopened.Close() })
 	var schemaVersion int
-	if err = reopened.db.QueryRowContext(ctx, `SELECT MAX(version) FROM schema_migrations`).Scan(&schemaVersion); err != nil || schemaVersion != 1 {
+	if err = reopened.db.QueryRowContext(ctx, `SELECT MAX(version) FROM schema_migrations`).Scan(&schemaVersion); err != nil || schemaVersion != 2 {
 		t.Fatalf("schema version=%d err=%v", schemaVersion, err)
 	}
 	job, err := reopened.Job(ctx, reserved.Job.ID, user.ID)
@@ -174,6 +209,68 @@ func TestStaleUpdateCannotResurrectCancelledJobAndNoopCreatesNoEvent(t *testing.
 	}
 }
 
+func TestLiveTelemetryBroadcastDoesNotAppendAuditEventPerSample(t *testing.T) {
+	ctx := context.Background()
+	now := time.Unix(1_700_000_000, 0).UTC()
+	st := testStore(t)
+	user := domain.User{ID: "telemetry-user", Name: "User", CanMovie: true}
+	if err := st.UpsertUser(ctx, user, now); err != nil {
+		t.Fatal(err)
+	}
+	token := addSelectable(t, st, user.ID, "telemetry-search", domain.Subject{Kind: domain.Movie, TMDBID: 779}, now)
+	reserved, err := st.ReserveJob(ctx, user.ID, token, "telemetry-key-0001", secure.Hash(token), now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	percent := 12.0
+	speed := int64(100)
+	job := reserved.Job
+	job.State = domain.Downloading
+	job.Progress = domain.Progress{Percent: &percent, BytesPerSecond: &speed, Text: "Downloading", Source: "arr"}
+	if err = st.UpdateJob(ctx, job, "acquisition.downloading", now.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	events, err := st.Events(ctx, user.ID, 0, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 1 {
+		t.Fatalf("initial state change events=%d", len(events))
+	}
+
+	signal := st.JobChangeSignal()
+	job, err = st.Job(ctx, job.ID, user.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	newSpeed := int64(250)
+	eta := int64(60)
+	job.Progress.BytesPerSecond = &newSpeed
+	job.Progress.ETASeconds = &eta
+	if err = st.UpdateJob(ctx, job, "acquisition.downloading", now.Add(2*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-signal:
+	default:
+		t.Fatal("live telemetry update did not wake subscribers")
+	}
+	events, err = st.Events(ctx, user.ID, 0, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 1 {
+		t.Fatalf("speed/ETA sample appended audit events: %d", len(events))
+	}
+	updated, err := st.Job(ctx, job.ID, user.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.Progress.BytesPerSecond == nil || *updated.Progress.BytesPerSecond != newSpeed {
+		t.Fatalf("canonical telemetry was not updated: %#v", updated.Progress)
+	}
+}
+
 func TestSelectionTTLIsEnforcedByServer(t *testing.T) {
 	ctx := context.Background()
 	st := testStore(t)
@@ -219,6 +316,41 @@ func TestRejectedAndUnapprovedCannotBeReserved(t *testing.T) {
 		if _, err = st.ReserveJob(ctx, user.ID, got.Results[0].Token, "idempotency-0000001", secure.Hash(got.Results[0].Token), now); !errors.Is(err, ErrRejected) {
 			t.Fatalf("candidate %q was selectable: %v", candidate.Title, err)
 		}
+	}
+}
+
+func TestSoftPolicyRejectionCanBeReserved(t *testing.T) {
+	ctx := context.Background()
+	st := testStore(t)
+	now := time.Unix(1_700_000_000, 0).UTC()
+	user := domain.User{ID: "user", Name: "User", CanMovie: true}
+	if err := st.UpsertUser(ctx, user, now); err != nil {
+		t.Fatal(err)
+	}
+	search := domain.Search{ID: "soft-policy-search", UserID: user.ID, Subject: domain.Subject{Kind: domain.Movie, TMDBID: 303}, State: domain.SearchPending, CreatedAt: now, UpdatedAt: now, ExpiresAt: now.Add(time.Hour)}
+	if err := st.CreateSearch(ctx, search); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.ClaimSearch(ctx, now); err != nil {
+		t.Fatal(err)
+	}
+	candidate := domain.Candidate{
+		Release: domain.Release{Title: "Low.Quality.Release", Indexer: "Test", Rejected: true, PolicyOverrideAllowed: true, RejectionReasons: []string{"Quality does not meet the configured profile"}},
+		Payload: []byte(`{"guid":"soft","indexerId":1}`),
+	}
+	resolved := domain.ResolvedSubject{Subject: search.Subject, Backend: "radarr", ArrItemID: 3}
+	if err := st.CompleteSearch(ctx, search.ID, resolved, []domain.Candidate{candidate}, now, now.Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	result, err := st.Search(ctx, search.ID, user.ID, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Results) != 1 || !result.Results[0].PolicyOverrideAllowed {
+		t.Fatalf("override flag was not persisted: %#v", result.Results)
+	}
+	if _, err = st.ReserveJob(ctx, user.ID, result.Results[0].Token, "soft-policy-key-01", secure.Hash(result.Results[0].Token), now); err != nil {
+		t.Fatalf("soft policy rejection was refused: %v", err)
 	}
 }
 

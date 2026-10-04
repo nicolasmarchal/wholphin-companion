@@ -7,6 +7,7 @@ import (
 	"errors"
 	"log/slog"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -17,17 +18,21 @@ import (
 )
 
 type arrFake struct {
-	mu         sync.Mutex
-	resolved   domain.ResolvedSubject
-	candidates []domain.Candidate
-	grabErr    error
-	grabbed    [][]byte
-	observe    domain.Observation
-	observeErr error
-	grabStart  chan struct{}
-	grabWait   chan struct{}
-	cancelHits int
-	cancelWait bool
+	mu             sync.Mutex
+	resolved       domain.ResolvedSubject
+	candidates     []domain.Candidate
+	grabErr        error
+	grabbed        [][]byte
+	observe        domain.Observation
+	observeErr     error
+	observeStart   chan struct{}
+	observeWait    chan struct{}
+	observeActive  int
+	observeMaximum int
+	grabStart      chan struct{}
+	grabWait       chan struct{}
+	cancelHits     int
+	cancelWait     bool
 }
 
 func (f *arrFake) Resolve(_ context.Context, subject domain.Subject) (domain.ResolvedSubject, error) {
@@ -84,8 +89,29 @@ func TestAcquirePersistsAfterHTTPContextIsCancelledDuringGrab(t *testing.T) {
 		t.Fatalf("grab count=%d", len(arr.grabs()))
 	}
 }
-func (f *arrFake) Observe(context.Context, domain.Job) (domain.Observation, error) {
-	return f.observe, f.observeErr
+func (f *arrFake) Observe(ctx context.Context, _ domain.Job) (domain.Observation, error) {
+	f.mu.Lock()
+	f.observeActive++
+	if f.observeActive > f.observeMaximum {
+		f.observeMaximum = f.observeActive
+	}
+	observation, observeErr := f.observe, f.observeErr
+	started, wait := f.observeStart, f.observeWait
+	f.mu.Unlock()
+	if started != nil {
+		started <- struct{}{}
+	}
+	if wait != nil {
+		select {
+		case <-wait:
+		case <-ctx.Done():
+			observeErr = ctx.Err()
+		}
+	}
+	f.mu.Lock()
+	f.observeActive--
+	f.mu.Unlock()
+	return observation, observeErr
 }
 func (f *arrFake) Cancel(ctx context.Context, _ domain.Job) error {
 	f.mu.Lock()
@@ -104,8 +130,15 @@ func (f *arrFake) grabs() [][]byte {
 	return append([][]byte(nil), f.grabbed...)
 }
 
+func (f *arrFake) maximumConcurrentObservations() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.observeMaximum
+}
+
 type jellyfinFake struct {
 	availability domain.Availability
+	user         domain.User
 	userSeen     string
 	err          error
 	authWait     bool
@@ -116,7 +149,7 @@ func (f *jellyfinFake) Authenticate(ctx context.Context, _ string) (domain.User,
 		<-ctx.Done()
 		return domain.User{}, ctx.Err()
 	}
-	return domain.User{}, nil
+	return f.user, nil
 }
 func (f *jellyfinFake) Availability(_ context.Context, userID string, _ domain.Subject, _ []int) (domain.Availability, error) {
 	f.userSeen = userID
@@ -179,6 +212,25 @@ func TestSessionExchangeUsesBoundedUpstreamContext(t *testing.T) {
 	}
 	if time.Since(started) > time.Second {
 		t.Fatal("session exchange was not bounded")
+	}
+}
+
+func TestSessionExchangeMatchesCanonicalJellyfinID(t *testing.T) {
+	_, st, arr, jellyfin, user, _ := appFixture(t)
+	user.ID = "e9d6114ac51e40ab960f588839fffac4"
+	jellyfin.user = user
+	application := New(st, arr, arr, jellyfin, qbFake{}, Options{
+		SessionTTL: time.Hour, SelectionTTL: 10 * time.Minute, SearchTimeout: time.Minute,
+		UpstreamTimeout: time.Second, ReconcileEvery: time.Minute,
+		AllowedUsers: map[string]struct{}{"E9D6114A-C51E-40AB-960F-588839FFFAC4": {}},
+	}, slog.New(slog.NewTextHandler(discardWriter{}, nil)))
+
+	session, err := application.ExchangeSession(context.Background(), "jellyfin-token")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if session.User.ID != user.ID {
+		t.Fatalf("session user=%q want=%q", session.User.ID, user.ID)
 	}
 }
 
@@ -429,8 +481,11 @@ func TestReconciliationBacksOffWithoutAppendingNoopEvents(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	arr.observe = domain.Observation{State: domain.Importing, Progress: domain.Progress{Text: "Importing", Source: "arr"}}
 	job, _ = st.Job(context.Background(), job.ID, user.ID)
 	application.reconcileJob(context.Background(), job)
+	baseline, _ := st.Job(context.Background(), job.ID, user.ID)
+	application.reconcileJob(context.Background(), baseline)
 	first, _ := st.Job(context.Background(), job.ID, user.ID)
 	if first.PollAttempt != 1 || !first.NextPollAt.After(now) {
 		t.Fatalf("first backoff=%#v", first)
@@ -444,7 +499,7 @@ func TestReconciliationBacksOffWithoutAppendingNoopEvents(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(events) != 1 {
+	if len(events) != 2 {
 		t.Fatalf("unchanged polls appended events: %d", len(events))
 	}
 	arr.observe = domain.Observation{State: domain.Downloading, Progress: domain.Progress{Text: "Downloading", Source: "arr"}}
@@ -455,9 +510,107 @@ func TestReconciliationBacksOffWithoutAppendingNoopEvents(t *testing.T) {
 	}
 }
 
+func TestActiveDownloadReconciliationKeepsBaseCadence(t *testing.T) {
+	application, st, arr, _, user, now := appFixture(t)
+	release := runSearch(t, application, user)
+	job, _, err := application.Acquire(context.Background(), user, release.Token, "progress-key-00001")
+	if err != nil {
+		t.Fatal(err)
+	}
+	arr.observe = domain.Observation{State: domain.Downloading, Progress: domain.Progress{Text: "Downloading", Source: "arr"}}
+	job, _ = st.Job(context.Background(), job.ID, user.ID)
+	application.reconcileJob(context.Background(), job)
+	first, _ := st.Job(context.Background(), job.ID, user.ID)
+	application.reconcileJob(context.Background(), first)
+	second, _ := st.Job(context.Background(), job.ID, user.ID)
+	if second.PollAttempt != 0 {
+		t.Fatalf("active download backed off: %#v", second)
+	}
+	if second.NextPollAt.After(now) {
+		t.Fatalf("active download was not left due for the next tick: %#v", second)
+	}
+	if application.options.ProgressEvery != 2*time.Second {
+		t.Fatalf("progress cadence=%s", application.options.ProgressEvery)
+	}
+}
+
+func TestFastProgressCadenceExcludesSlowAndFailingPhases(t *testing.T) {
+	application, _, _, _, _, now := appFixture(t)
+	for _, state := range []domain.JobState{domain.Queued, domain.Downloading, domain.Verifying} {
+		previous := domain.Job{ID: "healthy", State: state, PollAttempt: 4, NextPollAt: now.Add(time.Hour)}
+		job := previous
+		application.scheduleNextPoll(&job, previous)
+		if job.PollAttempt != 0 || job.NextPollAt.After(now) {
+			t.Fatalf("healthy %s job did not stay on fast cadence: %#v", state, job)
+		}
+	}
+	for _, job := range []domain.Job{
+		{ID: "error", State: domain.Downloading, ErrorCode: "arr_unavailable", PollAttempt: 2},
+		{ID: "import", State: domain.Importing, PollAttempt: 2},
+		{ID: "jellyfin", State: domain.WaitingJellyfin, PollAttempt: 2},
+	} {
+		previous := job
+		application.scheduleNextPoll(&job, previous)
+		if job.PollAttempt != previous.PollAttempt+1 || !job.NextPollAt.After(now) {
+			t.Fatalf("slow/error state did not back off: %#v", job)
+		}
+	}
+}
+
+func TestReconcileUsesBoundedPerJobConcurrency(t *testing.T) {
+	application, _, arr, _, user, _ := appFixture(t)
+	application.options.ReconcileWorkers = 2
+	for index := range 3 {
+		release := runSearchForTMDB(t, application, user, 500+index)
+		if _, _, err := application.Acquire(context.Background(), user, release.Token, "worker-key-0000"+strconv.Itoa(index)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	arr.observeStart = make(chan struct{}, 3)
+	arr.observeWait = make(chan struct{}, 3)
+	done := make(chan struct{})
+	go func() {
+		application.reconcile(context.Background(), false)
+		close(done)
+	}()
+
+	for range 2 {
+		select {
+		case <-arr.observeStart:
+		case <-time.After(time.Second):
+			t.Fatal("parallel reconciliation did not start")
+		}
+	}
+	select {
+	case <-arr.observeStart:
+		t.Fatal("reconciliation exceeded the worker bound")
+	case <-time.After(50 * time.Millisecond):
+	}
+	arr.observeWait <- struct{}{}
+	select {
+	case <-arr.observeStart:
+	case <-time.After(time.Second):
+		t.Fatal("a blocked job prevented the next job from starting")
+	}
+	arr.observeWait <- struct{}{}
+	arr.observeWait <- struct{}{}
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("bounded reconciliation did not finish")
+	}
+	if maximum := arr.maximumConcurrentObservations(); maximum != 2 {
+		t.Fatalf("maximum concurrent observations=%d", maximum)
+	}
+}
+
 func runSearch(t *testing.T, application *App, user domain.User) domain.Release {
+	return runSearchForTMDB(t, application, user, 42)
+}
+
+func runSearchForTMDB(t *testing.T, application *App, user domain.User, tmdbID int) domain.Release {
 	t.Helper()
-	search, err := application.StartSearch(context.Background(), user, domain.Subject{Kind: domain.Movie, TMDBID: 42})
+	search, err := application.StartSearch(context.Background(), user, domain.Subject{Kind: domain.Movie, TMDBID: tmdbID})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -495,10 +648,11 @@ func appFixture(t *testing.T) (*App, *store.Store, *arrFake, *jellyfinFake, doma
 		}},
 		observe: domain.Observation{State: domain.Queued, Progress: domain.Progress{Text: "Queued", Source: "arr"}},
 	}
-	jellyfin := &jellyfinFake{}
+	jellyfin := &jellyfinFake{user: user}
 	application := New(st, arr, arr, jellyfin, qbFake{}, Options{
 		SessionTTL: time.Hour, SelectionTTL: 10 * time.Minute, SearchTimeout: time.Minute,
-		UpstreamTimeout: time.Second, ReconcileEvery: time.Minute, AllowAllUsers: true,
+		UpstreamTimeout: time.Second, ReconcileEvery: time.Minute, ProgressEvery: 2 * time.Second,
+		AllowAllUsers: true,
 	}, slog.New(slog.NewTextHandler(discardWriter{}, nil)))
 	application.now = func() time.Time { return now }
 	return application, st, arr, jellyfin, user, now

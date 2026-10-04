@@ -19,25 +19,27 @@ type Arr struct {
 }
 
 type Config struct {
-	ListenAddr      string
-	DatabasePath    string
-	DataKey         []byte
-	AllowedUsers    map[string]struct{}
-	AllowAllUsers   bool
-	AllowCancel     bool
-	SessionTTL      time.Duration
-	SelectionTTL    time.Duration
-	ReconcileEvery  time.Duration
-	SearchTimeout   time.Duration
-	UpstreamTimeout time.Duration
-	WebhookSecret   string
-	Radarr          Arr
-	Sonarr          Arr
-	JellyfinURL     *url.URL
-	JellyfinAPIKey  string
-	QBittorrentURL  *url.URL
-	QBittorrentUser string
-	QBittorrentPass string
+	ListenAddr       string
+	DatabasePath     string
+	DataKey          []byte
+	AllowedUsers     map[string]struct{}
+	AllowAllUsers    bool
+	AllowCancel      bool
+	SessionTTL       time.Duration
+	SelectionTTL     time.Duration
+	ReconcileEvery   time.Duration
+	ProgressEvery    time.Duration
+	ReconcileWorkers int
+	SearchTimeout    time.Duration
+	UpstreamTimeout  time.Duration
+	WebhookSecret    string
+	Radarr           Arr
+	Sonarr           Arr
+	JellyfinURL      *url.URL
+	JellyfinAPIKey   string
+	QBittorrentURL   *url.URL
+	QBittorrentUser  string
+	QBittorrentPass  string
 }
 
 func Load() (Config, error) {
@@ -62,19 +64,21 @@ func Load() (Config, error) {
 		return Config{}, err
 	}
 	c := Config{
-		ListenAddr:      env("BFF_LISTEN_ADDR", "127.0.0.1:8090"),
-		DatabasePath:    env("BFF_DATABASE_PATH", "companion.db"),
-		AllowAllUsers:   envBool("BFF_ALLOW_ALL_JELLYFIN_USERS", false),
-		AllowCancel:     envBool("BFF_ALLOW_CANCEL", false),
-		SessionTTL:      envDuration("BFF_SESSION_TTL", 12*time.Hour),
-		SelectionTTL:    envDuration("BFF_SELECTION_TTL", 10*time.Minute),
-		ReconcileEvery:  envDuration("BFF_RECONCILE_INTERVAL", 10*time.Second),
-		SearchTimeout:   envDuration("BFF_SEARCH_TIMEOUT", 2*time.Minute),
-		UpstreamTimeout: envDuration("BFF_UPSTREAM_TIMEOUT", 30*time.Second),
-		WebhookSecret:   webhookSecret,
-		JellyfinAPIKey:  jellyfinKey,
-		QBittorrentUser: qbUser,
-		QBittorrentPass: qbPass,
+		ListenAddr:       env("BFF_LISTEN_ADDR", "127.0.0.1:8090"),
+		DatabasePath:     env("BFF_DATABASE_PATH", "companion.db"),
+		AllowAllUsers:    envBool("BFF_ALLOW_ALL_JELLYFIN_USERS", false),
+		AllowCancel:      envBool("BFF_ALLOW_CANCEL", false),
+		SessionTTL:       envDuration("BFF_SESSION_TTL", 12*time.Hour),
+		SelectionTTL:     envDuration("BFF_SELECTION_TTL", 10*time.Minute),
+		ReconcileEvery:   envDuration("BFF_RECONCILE_INTERVAL", 10*time.Second),
+		ProgressEvery:    envDuration("BFF_PROGRESS_INTERVAL", 2*time.Second),
+		ReconcileWorkers: envPositiveInt("BFF_RECONCILE_WORKERS", 4),
+		SearchTimeout:    envDuration("BFF_SEARCH_TIMEOUT", 2*time.Minute),
+		UpstreamTimeout:  envDuration("BFF_UPSTREAM_TIMEOUT", 30*time.Second),
+		WebhookSecret:    webhookSecret,
+		JellyfinAPIKey:   jellyfinKey,
+		QBittorrentUser:  qbUser,
+		QBittorrentPass:  qbPass,
 	}
 
 	key, err := base64.StdEncoding.DecodeString(dataKeyText)
@@ -103,8 +107,8 @@ func Load() (Config, error) {
 		if c.QBittorrentURL, err = parseURL("QBITTORRENT_URL", raw); err != nil {
 			return Config{}, err
 		}
-		if c.QBittorrentUser == "" || c.QBittorrentPass == "" {
-			return Config{}, errors.New("qBittorrent URL requires username and password")
+		if (c.QBittorrentUser == "") != (c.QBittorrentPass == "") {
+			return Config{}, errors.New("qBittorrent username and password must either both be set or both be empty")
 		}
 	}
 	return c, nil
@@ -191,6 +195,18 @@ func envDuration(name string, fallback time.Duration) time.Duration {
 		return fallback
 	}
 	parsed, err := time.ParseDuration(value)
+	if err != nil || parsed <= 0 {
+		return fallback
+	}
+	return parsed
+}
+
+func envPositiveInt(name string, fallback int) int {
+	value := strings.TrimSpace(os.Getenv(name))
+	if value == "" {
+		return fallback
+	}
+	parsed, err := strconv.Atoi(value)
 	if err != nil || parsed <= 0 {
 		return fallback
 	}
